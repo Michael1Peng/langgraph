@@ -1,6 +1,7 @@
 from typing import Annotated, List, TypedDict
 import operator
 import os
+import subprocess
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -11,120 +12,175 @@ from langchain_community.document_loaders import DirectoryLoader
 
 # 定义状态类型
 class SearchState(TypedDict):
-    messages: Annotated[List, operator.add]  # 消息历史
-    query: str  # 搜索查询
-    iteration: int  # 当前迭代次数
-    results: List[dict]  # 搜索结果
+    answer_list: Annotated[List[str], operator.add]  # 答案列表
+    current_query: str  # 当前搜索查询
+    searched_files: List[str]  # 已搜索过的文件
+    plan_list: List[str]  # 计划列表
+    max_iteration: int  # 最大迭代次数
+    current_iteration: int  # 当前迭代次数
     vectorstore: Chroma  # 向量存储
+    target: str  # 搜索目标
 
-# 创建搜索提示模板
-search_prompt = ChatPromptTemplate.from_messages([
-    ("system", """你是一个文件搜索助手。根据用户的查询,帮助找到最相关的文件。
-    当前迭代次数: {iteration}
-    请分析已找到的文件,并提供下一步搜索建议。
-    如果已经找到足够相关的文件或达到最大迭代次数,请回复 FINAL ANSWER。"""),
+# Linux命令工具
+def get_file_content(file_path: str) -> str:
+    """使用cat命令获取文件内容"""
+    try:
+        result = subprocess.run(['cat', file_path], capture_output=True, text=True)
+        return result.stdout
+    except Exception as e:
+        return f"Error reading file: {str(e)}"
+
+# 创建规划提示模板
+planner_prompt = ChatPromptTemplate.from_messages([
+    ("system", """你是一个任务规划助手。根据当前的答案列表和目标，判断是否需要继续搜索。
+    如果需要继续，请提供下一步的搜索查询。
+    
+    当前目标: {target}
+    当前答案列表: {answer_list}
+    当前迭代次数: {current_iteration}
+    最大迭代次数: {max_iteration}
+    
+    如果已经找到完整答案或达到最大迭代次数，请回复 FINAL。
+    否则，请提供下一步搜索查询。"""),
+    MessagesPlaceholder(variable_name="messages"),
+])
+
+# 创建执行提示模板
+executor_prompt = ChatPromptTemplate.from_messages([
+    ("system", """你是一个文件分析助手。根据搜索到的文件内容，提供相关答案。
+    
+    搜索查询: {query}
+    相关文件内容: {file_contents}
+    
+    请分析文件内容并提供答案。"""),
     MessagesPlaceholder(variable_name="messages"),
 ])
 
 # 初始化 LLM
-llm = ChatOpenAI(model="chatgpt-4o-latest")
-search_chain = search_prompt | llm
+llm = ChatOpenAI(model="gpt-4o-mini")
+planner_chain = planner_prompt | llm
+executor_chain = executor_prompt | llm
 
 def load_documents(directory: str) -> Chroma:
     """加载目录中的文档并创建向量存储"""
     loader = DirectoryLoader(directory, glob="**/*.*")
     documents = loader.load()
     
-    text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+    text_splitter = CharacterTextSplitter(chunk_size=100000, chunk_overlap=0)
     texts = text_splitter.split_documents(documents)
     
     embeddings = OpenAIEmbeddings()
     vectorstore = Chroma.from_documents(texts, embeddings)
     return vectorstore
 
-def search_documents(state: SearchState):
-    """搜索文档并更新状态"""
+def planner(state: SearchState):
+    """规划节点：判断是否继续搜索，并更新搜索查询"""
+    if state["current_iteration"] >= state["max_iteration"]:
+        return {"plan_list": ["FINAL"]}
+        
+    result = planner_chain.invoke({
+        "messages": [HumanMessage(content="请分析当前进度")],
+        "target": state["target"],
+        "answer_list": state["answer_list"],
+        "current_iteration": state["current_iteration"],
+        "max_iteration": state["max_iteration"]
+    })
+    
+    if "FINAL" in result.content:
+        return {"plan_list": ["FINAL"]}
+    
+    return {
+        "current_query": result.content,
+        "current_iteration": state["current_iteration"] + 1
+    }
+
+def executor(state: SearchState):
+    """执行节点：搜索文件并获取答案"""
     # 使用向量存储搜索相关文档
-    results = state["vectorstore"].similarity_search(state["query"], k=3)
+    results = state["vectorstore"].similarity_search(
+        state["current_query"], 
+        k=30,
+        # filter={"source": {"$nin": state["searched_files"]}}
+    )
     
-    # 准备消息内容
-    content = f"找到以下相关文件:\n"
+    # 获取文件内容
+    file_contents = []
+    new_searched_files = []
     for doc in results:
-        content += f"\n文件路径: {doc.metadata['source']}\n"
-        content += f"内容预览: {doc.page_content[:200]}...\n"
+        file_path = doc.metadata["source"]
+        if file_path not in state["searched_files"]:
+            content = get_file_content(file_path)
+            file_contents.append(f"File: {file_path}\n{content}")
+            new_searched_files.append(file_path)
     
-    # 让 LLM 分析结果
-    result = search_chain.invoke({
-        "messages": [HumanMessage(content=content)],
-        "iteration": state["iteration"]
+    # 分析内容获取答案
+    result = executor_chain.invoke({
+        "messages": [HumanMessage(content="请分析文件内容")],
+        "query": state["current_query"],
+        "file_contents": "\n\n".join(file_contents)
     })
     
     return {
-        "messages": [result],
-        "results": [{"path": doc.metadata["source"], "content": doc.page_content} for doc in results],
-        "iteration": state["iteration"] + 1
+        "answer_list": [result.content],
+        "searched_files": new_searched_files
     }
 
 def should_continue(state: SearchState):
     """判断是否继续搜索"""
-    if state["iteration"] >= 3:  # 最多迭代3次
+    if state["plan_list"] and state["plan_list"][-1] == "FINAL":
         return END
-    
-    last_message = state["messages"][-1]
-    if "FINAL ANSWER" in last_message.content:
-        return END
-        
-    return "search"
+    return "executor"
 
 # 创建工作流图
 workflow = StateGraph(SearchState)
 
-# 添加搜索节点
-workflow.add_node("search", search_documents)
+# 添加节点
+workflow.add_node("planner", planner)
+workflow.add_node("executor", executor)
 
-# 添加条件边
+# 添加边
 workflow.add_conditional_edges(
-    "search",
+    "planner",
     should_continue,
     {
-        "search": "search",
+        "executor": "executor",
         END: END
     }
 )
-
-workflow.add_edge(START, "search")
+workflow.add_edge("executor", "planner")
+workflow.add_edge(START, "planner")
 
 # 编译图
 graph = workflow.compile()
 
-def search_in_directory(directory: str, query: str):
+def search_in_directory(directory: str, target: str, max_iteration: int = 3):
     """在指定目录中搜索相关文档"""
     # 加载文档到向量存储
     vectorstore = load_documents(directory)
     
     # 初始化状态
     initial_state = {
-        "messages": [],
-        "query": query,
-        "iteration": 0,
-        "results": [],
+        "answer_list": [],
+        "current_query": "",
+        "searched_files": [],
+        "plan_list": [],
+        "max_iteration": max_iteration,
+        "current_iteration": 0,
+        "target": target,
         "vectorstore": vectorstore
     }
     
     # 执行搜索工作流
     for event in graph.stream(initial_state):
-        event_search = event["search"]
-        if "messages" in event_search:
-            for message in event_search["messages"]:
-                if isinstance(message, AIMessage):
-                    print(f"\n迭代 {event_search['iteration']}:")
-                    print(message.content)
-                    if event_search.get("results"):
-                        print("\n找到的文件:")
-                        for result in event_search["results"]:
-                            print(f"- 路径: {result['path']}")
+        if "planner" in event:
+            print(f"\n规划迭代 {event['planner'].get('current_iteration', 0)}:")
+            print(f"下一步查询: {event['planner'].get('current_query', '')}")
+        elif "executor" in event:
+            print("\n执行结果:")
+            print(f"新增答案: {event['executor'].get('answer_list', [])}")
+            print(f"搜索的文件: {event['executor'].get('searched_files', [])}")
 
 if __name__ == "__main__":
-    directory = "/mnt/f/iCloudDrive/workshop/副业/享梦游/私域"
-    query = "如何使用 LangChain?"  # 搜索查询
-    search_in_directory(directory, query)
+    directory = "/home/michael/ubuntu-repos/docsets/lobe-chat/self-hosting/advanced"
+    target = "如何部署 Lobe Chat"
+    search_in_directory(directory, target)
