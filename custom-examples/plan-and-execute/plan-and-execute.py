@@ -143,7 +143,7 @@ llm = ChatOpenAI(model="gpt-4o")
 agent_executor = create_react_agent(llm, tools, state_modifier=prompt)
 
 # %%
-agent_executor.invoke({"messages": [("user", "who is the winnner of the lol s13?")]})
+agent_executor.invoke({"messages": [("user", "who is the winnner of the lol s14?")]})
 
 # %% [markdown]
 # ## Define the State
